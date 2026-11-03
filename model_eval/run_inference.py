@@ -166,7 +166,7 @@ def pipeline_frames_per_block(pipe) -> int:
 def save_image(frame: torch.Tensor, path: Path):
     """Save a single CHW tensor image."""
     image = (frame.cpu().float().clamp(0, 1).permute(1, 2, 0).numpy() * 255).round().astype("uint8")
-    Image.fromarray(image).save(path)
+    Image.fromarray(image).save(path, compress_level=1)  # lossless; much faster than the default level 6
 
 
 def _to_list(value) -> list:
@@ -214,14 +214,17 @@ def expected_video_frame_names(item: dict) -> list[str]:
     return [f"{idx:05d}.png" for idx in frame_indices]
 
 
-def output_kinds(item: dict) -> tuple[str, ...]:
-    return ("pred", "gt", "rendered") if "rgb_gt" in item else ("pred", "rendered")
+def output_kinds(item: dict, skip_rendered: bool = False) -> tuple[str, ...]:
+    kinds = ("pred", "gt", "rendered") if "rgb_gt" in item else ("pred", "rendered")
+    # --skip_rendered_frames: the rendered input copies are not written (callers that only read pred).
+    return tuple(k for k in kinds if k != "rendered") if skip_rendered else kinds
 
 
-def output_frames_complete(scene_dir: Path, item: dict) -> bool:
+def output_frames_complete(scene_dir: Path, item: dict, skip_rendered: bool = False) -> bool:
     names = expected_output_frame_names(item)
     frames_dir = scene_dir / "frames" / "batch_0000"
-    return all((frames_dir / kind / name).is_file() for kind in output_kinds(item) for name in names)
+    return all((frames_dir / kind / name).is_file()
+               for kind in output_kinds(item, skip_rendered) for name in names)
 
 
 def output_video_frames_complete(scene_dir: Path, item: dict) -> bool:
@@ -472,7 +475,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
     else:
         scene_dir = output_dir / scene_id
 
-    if not args.replace_if_exists and output_frames_complete(scene_dir, item):
+    if not args.replace_if_exists and output_frames_complete(scene_dir, item, args.skip_rendered_frames):
         if args.save_frame_outputs_only or output_video_frames_complete(scene_dir, item):
             return
 
@@ -584,9 +587,10 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
     # Save individual frames
     frames_dir = scene_dir / "frames" / "batch_0000"
     video_frames_dir = scene_dir / "video_frames" / "batch_0000"
-    for subdir in output_kinds(item):
+    for subdir in output_kinds(item, args.skip_rendered_frames):
         (frames_dir / subdir).mkdir(parents=True, exist_ok=True)
-        if not args.save_frame_outputs_only:
+    if not args.save_frame_outputs_only:
+        for subdir in output_kinds(item):
             (video_frames_dir / subdir).mkdir(parents=True, exist_ok=True)
 
     target_h = item.get("target_h")
@@ -619,7 +623,8 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
             save_image(pred_frame, frames_dir / "pred" / fname)
             if gt_frame is not None:
                 save_image(gt_frame, frames_dir / "gt" / fname)
-            save_image(rendered_frame, frames_dir / "rendered" / fname)
+            if not args.skip_rendered_frames:
+                save_image(rendered_frame, frames_dir / "rendered" / fname)
 
         if not args.save_frame_outputs_only:
             fname = f"{frame_indices[frame_idx]:05d}.png"
@@ -819,8 +824,8 @@ class ArtiFixerCorrector:
         """Build a corrector for the reconstructed_colmap trajectory path.
 
         split_path/save_dir are dummies here (required by the CLI parser) — they are overridden on
-        every `correct_split` call. --save_frame_outputs_only writes only the pred PNGs and skips
-        the comparison-video encode (an eval-only artifact).
+        every `correct_split` call. --save_frame_outputs_only skips the comparison-video encode (an
+        eval-only artifact) and --skip_rendered_frames the rendered/ input copies: callers read pred/ only.
         """
         args = parse_args([
             "--evalset", "reconstructed_colmap",
@@ -830,6 +835,7 @@ class ArtiFixerCorrector:
             "--inference_pipeline", inference_pipeline,
             "--num_inference_steps", str(num_inference_steps),
             "--save_frame_outputs_only",
+            "--skip_rendered_frames",
         ])
         return cls(args, fp8_ckpt=fp8_ckpt)
 
@@ -900,6 +906,11 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
         "--save_frame_outputs_only",
         action="store_true",
         help="Only save pred/gt/rendered PNG frames needed for metrics; skip comparison videos and diagnostic videos.",
+    )
+    parser.add_argument(
+        "--skip_rendered_frames",
+        action="store_true",
+        help="Do not write the rendered/ input frames (for callers that only read pred/; metrics need them).",
     )
     parser.add_argument(
         "--distributed_timeout_minutes",
